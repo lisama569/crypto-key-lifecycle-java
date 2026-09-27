@@ -61,6 +61,18 @@ public class LifecycleExceptionHandler {
         return build(HttpStatus.CONFLICT, ex);
     }
 
+    @ExceptionHandler(com.github.lisama569.cryptokeylifecyclejava.error.VersionInUseException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleVersionInUse(
+            com.github.lisama569.cryptokeylifecyclejava.error.VersionInUseException ex) {
+        return build(HttpStatus.CONFLICT, ex);
+    }
+
+    @ExceptionHandler(com.github.lisama569.cryptokeylifecyclejava.error.ActiveVersionException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleActiveVersion(
+            com.github.lisama569.cryptokeylifecyclejava.error.ActiveVersionException ex) {
+        return build(HttpStatus.CONFLICT, ex);
+    }
+
     /** 兜底：任何未预期异常返回 500 且不含内部细节，避免泄露明文或堆栈。 */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Dtos.ErrorResponse> handleUnexpected(Exception ex) {

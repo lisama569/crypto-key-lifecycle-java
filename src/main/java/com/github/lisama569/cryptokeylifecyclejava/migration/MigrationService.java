@@ -2,7 +2,9 @@ package com.github.lisama569.cryptokeylifecyclejava.migration;
 
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyManager;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyVersion;
+import com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException;
 import com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException;
+import com.github.lisama569.cryptokeylifecyclejava.error.UnknownVersionException;
 import java.util.List;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
@@ -89,6 +91,90 @@ public class MigrationService {
         } finally {
             migrationLock.unlock();
         }
+    }
+
+    /**
+     * 按来源版本定向清理：只把 {@code fromVersion} 这一代旧数据重加密到当前 ACTIVE 版本，
+     * 不触碰其他代旧版本的数据。
+     *
+     * <p>与 {@link #migrateToCurrent(Integer)} 同样保证幂等（已在目标版本的记录跳过）、
+     * 可中断续跑（每批处理 {@code limit} 条，剩余下次继续）、失败隔离（单条失败保留原密文）。
+     * 多代旧版本并存时各代可独立清理：清理完某一代后其引用数精确归零，其他代不受影响。
+     *
+     * @param fromVersion 要清理的来源版本；必须已知且不是当前 ACTIVE 版本
+     * @param limit       本批最多处理多少条；null 或 &lt;=0 表示一次性处理全部
+     */
+    public SourceCleanupProgress migrateFromVersion(int fromVersion, Integer limit) {
+        KeyVersion target = keyManager.currentVersion();
+        int targetVersion = target.version();
+        if (fromVersion == targetVersion) {
+            log.warn("op=CLEANUP result=REJECT basis=SOURCE_IS_ACTIVE fromVersion={}", fromVersion);
+            throw new KeyConflictException(
+                    "cannot clean up the currently active version " + fromVersion);
+        }
+        boolean known = keyManager.listVersions().stream()
+                .anyMatch(v -> v.version() == fromVersion);
+        if (!known) {
+            log.warn("op=CLEANUP result=REJECT basis=UNKNOWN_VERSION fromVersion={}", fromVersion);
+            throw new UnknownVersionException("unknown key version: " + fromVersion);
+        }
+
+        migrationLock.lock();
+        try {
+            List<DataRecord> snapshot = repository.findAll();
+            int sourceTotal = 0;
+            for (DataRecord record : snapshot) {
+                if (record.keyVersion() == fromVersion) {
+                    sourceTotal++;
+                }
+            }
+            int migrated = 0;
+            int skipped = 0;
+            int failed = 0;
+
+            for (DataRecord record : snapshot) {
+                if (record.keyVersion() != fromVersion) {
+                    continue; // 定向清理：其他代旧版本与目标版本记录一律不触碰
+                }
+                if (limit != null && limit > 0 && (migrated + failed) >= limit) {
+                    break; // 批量边界：中断点，剩余同代记录下次续跑
+                }
+                try {
+                    migrateOne(record, targetVersion);
+                    migrated++;
+                    log.info("op=CLEANUP result=ACCEPT basis=RE_ENCRYPTED id={} fromVersion={} toVersion={}",
+                            record.id(), fromVersion, targetVersion);
+                } catch (AlreadyMigratedException e) {
+                    skipped++;
+                    log.info("op=CLEANUP result=SKIP basis=ALREADY_MIGRATED id={}", record.id());
+                } catch (KeyLifecycleException e) {
+                    failed++;
+                    log.warn("op=CLEANUP result=FAIL basis={} id={} fromVersion={} toVersion={}",
+                            e.reasonCode(), record.id(), fromVersion, targetVersion);
+                }
+            }
+
+            int remaining = countOnVersion(fromVersion);
+            SourceCleanupProgress progress = new SourceCleanupProgress(fromVersion, targetVersion,
+                    sourceTotal, migrated, skipped, failed, remaining, remaining == 0);
+            log.info("op=CLEANUP_BATCH result=DONE basis=PROGRESS fromVersion={} toVersion={} sourceTotal={} migrated={} skipped={} failed={} remaining={} completed={}",
+                    fromVersion, targetVersion, sourceTotal, migrated, skipped, failed,
+                    remaining, progress.completed());
+            return progress;
+        } finally {
+            migrationLock.unlock();
+        }
+    }
+
+    /** 实时统计仍停留在指定版本的记录条数（定向清理收敛核验与下线门禁共用口径）。 */
+    private int countOnVersion(int version) {
+        int count = 0;
+        for (DataRecord record : repository.findAll()) {
+            if (record.keyVersion() == version) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private void migrateOne(DataRecord record, int targetVersion) {

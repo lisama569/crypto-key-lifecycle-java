@@ -173,6 +173,68 @@ public class KeyManager {
         }
     }
 
+    /**
+     * 受保护的安全下线（decommission）：把不再被依赖的旧版本推进到终态 REVOKED。
+     *
+     * <p>与 {@link #revoke(int)} 的区别：revoke 是无条件吊销（运维强制手段），
+     * decommission 是带门禁的安全下线，只有同时满足才允许成功：
+     * <ul>
+     *   <li>版本存在且处于 RETIRED（PENDING 为轮换中间态，ACTIVE 正在提供服务）；</li>
+     *   <li>{@code referenceCount} 实时统计的引用条数为 0。</li>
+     * </ul>
+     *
+     * <p>检查与状态转换在 {@code lifecycleLock} 内原子完成：并发抢同一版本时只有一个
+     * 成功，其余看到 REVOKED 终态并收到 {@link RevokedVersionException}；
+     * 重复提交同样得到 ALREADY_REVOKED 语义，不会出现半停用状态。
+     *
+     * @param version         要下线的版本号
+     * @param referenceCount  实时引用统计（在锁内求值，保证判定与转换之间无并发漂移）
+     */
+    public KeyVersion decommission(int version, java.util.function.IntSupplier referenceCount) {
+        lifecycleLock.lock();
+        try {
+            KeyVersion current = requireVersion(version, "DECOMMISSION");
+            switch (current.state()) {
+                case REVOKED -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=ALREADY_REVOKED version={}", version);
+                    throw new RevokedVersionException(
+                            "key version " + version + " is already decommissioned (revoked)");
+                }
+                case ACTIVE -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=STILL_SERVING version={} state={}",
+                            version, current.state());
+                    throw new com.github.lisama569.cryptokeylifecyclejava.error.ActiveVersionException(
+                            "key version " + version + " is the active serving version");
+                }
+                case PENDING -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=NOT_ACTIVATABLE version={} state={}",
+                            version, current.state());
+                    throw new KeyConflictException(
+                            "key version " + version + " is pending and cannot be decommissioned");
+                }
+                case RETIRED -> {
+                    int refs = referenceCount.getAsInt();
+                    if (refs > 0) {
+                        log.warn("op=DECOMMISSION result=REJECT basis=STILL_REFERENCED version={} references={}",
+                                version, refs);
+                        throw new com.github.lisama569.cryptokeylifecyclejava.error.VersionInUseException(
+                                "key version " + version + " is still referenced by "
+                                        + refs + " data record(s)");
+                    }
+                    KeyVersion revoked = new KeyVersion(version, KeyState.REVOKED,
+                            current.createdAt(), current.retiredAt(), Instant.now());
+                    keyStore.updateState(revoked);
+                    log.info("op=DECOMMISSION result=ACCEPT basis=REFERENCES_ZERO version={} {}->{}",
+                            version, current.state(), KeyState.REVOKED);
+                    return revoked;
+                }
+                default -> throw new IllegalStateException("unhandled state: " + current.state());
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+    }
+
     /** 使用当前 ACTIVE 版本加密。null/空明文被拒绝，绝不返回错误明文。 */
     public String encrypt(String plaintext) {
         if (plaintext == null || plaintext.isEmpty()) {

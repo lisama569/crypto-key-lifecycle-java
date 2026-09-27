@@ -62,4 +62,11 @@ public class KeyLifecycleConfig {
     public MigrationService migrationService(KeyManager keyManager, DataRepository repository) {
         return new MigrationService(keyManager, repository);
     }
+
+    @Bean
+    public com.github.lisama569.cryptokeylifecyclejava.lifecycle.VersionLifecycleService versionLifecycleService(
+            KeyManager keyManager, DataRepository repository) {
+        return new com.github.lisama569.cryptokeylifecyclejava.lifecycle.VersionLifecycleService(
+                keyManager, repository);
+    }
 }

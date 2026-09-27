@@ -10,6 +10,7 @@ public final class Dtos {
     public record DecryptResponse(String plaintext, int keyVersion) { }
     public record RotateResponse(int previousVersion, int activeVersion) { }
     public record RevokeRequest(Integer version) { }
+    public record DecommissionRequest(Integer version) { }
     public record VersionView(int version, String state, String createdAt, String retiredAt, String revokedAt) { }
     public record ErrorResponse(String error, String message) { }
 }
