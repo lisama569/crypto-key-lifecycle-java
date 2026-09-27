@@ -21,14 +21,19 @@ import org.slf4j.LoggerFactory;
  *   生成 → ACTIVE（首个版本）
  *   ACTIVE  --rotate()-->  RETIRED（旧） + ACTIVE（新）
  *   ACTIVE / RETIRED --revoke(v)--> REVOKED（终态）
+ *   RETIRED（引用清零后）--decommission(v)--> DECOMMISSIONED（终态）
  * </pre>
  *
  * <p>并发与原子性语义：
  * <ul>
- *   <li>{@code lifecycleLock} 保证“生成新密钥 + 旧版本转 RETIRED + 新版本 ACTIVE”整体原子，
- *       并发轮换被串行化；轮换流程中任何异常都会在锁内回滚本次变更，不留半更新状态；</li>
+ *   <li>{@code lifecycleLock} 保证“生成新密钥 + 新版本 ACTIVE + 旧版本转 RETIRED”整体串行；
+ *       切换顺序刻意安排为“新版本先 ACTIVE、旧版本再 RETIRED”，因此整个轮换过程始终存在
+ *       ACTIVE 版本，并发加密永远读得到服务版本，不会落入“无 ACTIVE”窗口；中途异常在锁内
+ *       回滚本次变更（旧版本保持/恢复 ACTIVE，未完成的新版本删除），不留半更新状态；</li>
  *   <li>加密始终读取当下唯一的 ACTIVE 版本，轮换后新数据只使用新版本；</li>
- *   <li>解密允许 ACTIVE 与保留期内的 RETIRED 版本，REVOKED 一律拒绝；</li>
+ *   <li>解密允许 ACTIVE 与保留期内的 RETIRED 版本，REVOKED / DECOMMISSIONED 一律拒绝；</li>
+ *   <li>安全下线 {@link #decommission(int)} 只在 RETIRED 上执行，是与 REVOKED 并列的终态；
+ *       “引用是否清零”的数据门禁由 VersionDecommissionService 在维护锁内先判定；</li>
  *   <li>同一版本不会被重复启用（put 拒绝重复版本号，状态机不允许逆向转换）。</li>
  * </ul>
  */
@@ -69,7 +74,7 @@ public class KeyManager {
             }
             int version = keyStore.nextVersion();
             SecretKey key = AesGcmCipher.generateKey(keyBits);
-            KeyVersion meta = new KeyVersion(version, KeyState.ACTIVE, Instant.now(), null, null);
+            KeyVersion meta = new KeyVersion(version, KeyState.ACTIVE, Instant.now(), null, null, null);
             keyStore.put(meta, key);
             log.info("op=GENERATE result=ACCEPT basis=FIRST_VERSION version={} state={}",
                     version, meta.state());
@@ -92,20 +97,22 @@ public class KeyManager {
             try {
                 // 1) 先生成并写入新密钥（PENDING 不可用），保证密钥材料就绪后才切换状态
                 SecretKey newKey = AesGcmCipher.generateKey(keyBits);
-                newMeta = new KeyVersion(newVersionNumber, KeyState.PENDING, Instant.now(), null, null);
+                newMeta = new KeyVersion(newVersionNumber, KeyState.PENDING, Instant.now(), null, null, null);
                 keyStore.put(newMeta, newKey);
 
-                // 2) 旧 ACTIVE -> RETIRED（保留期内仍可解密）
+                // 2) 新版本 PENDING -> ACTIVE。必须先于旧版本退役：这样整个切换过程中
+                //    “始终存在一个 ACTIVE”，并发加密永远读得到服务版本，不会落入无 ACTIVE 窗口。
+                //    此刻短暂存在两个 ACTIVE，加密的 current() 取其一，均为合法服务版本。
+                KeyVersion active = new KeyVersion(newVersionNumber, KeyState.ACTIVE,
+                        newMeta.createdAt(), null, null, null);
+                keyStore.updateState(active);
+
+                // 3) 旧 ACTIVE -> RETIRED（保留期内仍可解密）
                 if (current != null) {
                     KeyVersion retired = new KeyVersion(current.version(), KeyState.RETIRED,
-                            current.createdAt(), Instant.now(), null);
+                            current.createdAt(), Instant.now(), null, null);
                     keyStore.updateState(retired);
                 }
-
-                // 3) 新版本 PENDING -> ACTIVE
-                KeyVersion active = new KeyVersion(newVersionNumber, KeyState.ACTIVE,
-                        newMeta.createdAt(), null, null);
-                keyStore.updateState(active);
 
                 log.info("op=ROTATE result=ACCEPT basis=ATOMIC_SWITCH previousVersion={} activeVersion={}",
                         current == null ? -1 : current.version(), newVersionNumber);
@@ -127,14 +134,15 @@ public class KeyManager {
 
     private void rollbackAfterFailedRotate(KeyVersion previousActive, KeyVersion pendingNew) {
         try {
-            // 旧版本若已被转 RETIRED，恢复为 ACTIVE
+            // 旧版本若已被转 RETIRED，先恢复为 ACTIVE，保证系统始终有服务版本
             if (previousActive != null && keyStore.find(previousActive.version())
                     .map(m -> m.state() == KeyState.RETIRED).orElse(false)) {
                 keyStore.updateState(previousActive);
             }
-            // 新种子版本从未启用，直接移除，版本链不留废版本；下一次轮换复用该版本号
+            // 新版本从未真正完成切换（仍为 PENDING，或仅短暂 ACTIVE 但旧版本尚未退役），
+            // 直接移除，版本链不留废版本，下一次轮换复用该版本号
             if (pendingNew != null) {
-                keyStore.removeIfPending(pendingNew.version());
+                keyStore.removeUnfinishedVersion(pendingNew.version());
             }
         } catch (RuntimeException rollbackError) {
             log.error("op=ROTATE result=ROLLBACK_ERROR version={} error={}",
@@ -155,7 +163,7 @@ public class KeyManager {
                 }
                 case ACTIVE, RETIRED -> {
                     KeyVersion revoked = new KeyVersion(version, KeyState.REVOKED,
-                            current.createdAt(), current.retiredAt(), Instant.now());
+                            current.createdAt(), current.retiredAt(), Instant.now(), null);
                     keyStore.updateState(revoked);
                     log.info("op=REVOKE result=ACCEPT basis=STATE_TRANSITION version={} {}->{}",
                             version, current.state(), KeyState.REVOKED);
@@ -166,6 +174,11 @@ public class KeyManager {
                             version, current.state());
                     throw new KeyConflictException(
                             "key version " + version + " is pending and cannot be revoked");
+                }
+                case DECOMMISSIONED -> {
+                    log.warn("op=REVOKE result=REJECT basis=ALREADY_DECOMMISSIONED version={}", version);
+                    throw new com.github.lisama569.cryptokeylifecyclejava.error.VersionDecommissionedException(
+                            "key version " + version + " is already decommissioned");
                 }
             };
         } finally {
@@ -206,6 +219,11 @@ public class KeyManager {
             throw new RevokedVersionException(
                     "key version " + version + " has been revoked; decryption refused");
         }
+        if (meta.state() == KeyState.DECOMMISSIONED) {
+            log.warn("op=DECRYPT result=REJECT basis=DECOMMISSIONED_VERSION version={}", version);
+            throw new com.github.lisama569.cryptokeylifecyclejava.error.VersionDecommissionedException(
+                    "key version " + version + " has been decommissioned; decryption refused");
+        }
         if (meta.state() != KeyState.ACTIVE && meta.state() != KeyState.RETIRED) {
             log.warn("op=DECRYPT result=REJECT basis=STATE_NOT_USABLE version={} state={}",
                     version, meta.state());
@@ -223,6 +241,62 @@ public class KeyManager {
     public KeyVersion currentVersion() {
         return keyStore.current().orElseThrow(() ->
                 new KeyConflictException("no active key version available"));
+    }
+
+    /** 按版本号读取版本元数据；不存在抛 {@link UnknownVersionException}。 */
+    public KeyVersion getVersion(int version) {
+        return requireVersion(version, "INSPECT");
+    }
+
+    /**
+     * 将一个 RETIRED 版本安全下线为 DECOMMISSIONED（终态）。
+     *
+     * <p>这里只做状态机门禁（生命周期锁内原子完成）：
+     * 未知版本 → {@link UnknownVersionException}；ACTIVE（正在服务）→
+     * {@link com.github.lisama569.cryptokeylifecyclejava.error.VersionActiveException}；
+     * REVOKED → {@link RevokedVersionException}；重复下线（已 DECOMMISSIONED）→
+     * {@link com.github.lisama569.cryptokeylifecyclejava.error.VersionDecommissionedException}。
+     * “引用是否清零”的数据门禁由 VersionDecommissionService 在维护锁内先判定，
+     * 二者组合保证不会出现“已下线但历史数据打不开”。
+     */
+    public KeyVersion decommission(int version) {
+        lifecycleLock.lock();
+        try {
+            KeyVersion current = requireVersion(version, "DECOMMISSION");
+            return switch (current.state()) {
+                case DECOMMISSIONED -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=ALREADY_DECOMMISSIONED version={}", version);
+                    throw new com.github.lisama569.cryptokeylifecyclejava.error.VersionDecommissionedException(
+                            "key version " + version + " is already decommissioned");
+                }
+                case ACTIVE -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=CURRENTLY_ACTIVE version={}", version);
+                    throw new com.github.lisama569.cryptokeylifecyclejava.error.VersionActiveException(
+                            "key version " + version + " is the active serving version and cannot be decommissioned");
+                }
+                case REVOKED -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=ALREADY_REVOKED version={}", version);
+                    throw new RevokedVersionException(
+                            "key version " + version + " is revoked and cannot be decommissioned");
+                }
+                case PENDING -> {
+                    log.warn("op=DECOMMISSION result=REJECT basis=NOT_RETIRED version={} state={}",
+                            version, current.state());
+                    throw new KeyConflictException(
+                            "key version " + version + " is pending and cannot be decommissioned");
+                }
+                case RETIRED -> {
+                    KeyVersion decommissioned = new KeyVersion(version, KeyState.DECOMMISSIONED,
+                            current.createdAt(), current.retiredAt(), current.revokedAt(), Instant.now());
+                    keyStore.updateState(decommissioned);
+                    log.info("op=DECOMMISSION result=ACCEPT basis=REFERENCES_CLEARED version={} {}->{}",
+                            version, current.state(), KeyState.DECOMMISSIONED);
+                    yield decommissioned;
+                }
+            };
+        } finally {
+            lifecycleLock.unlock();
+        }
     }
 
     public List<KeyVersion> listVersions() {

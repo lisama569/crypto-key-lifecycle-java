@@ -6,6 +6,9 @@ import com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException;
 import com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException;
 import com.github.lisama569.cryptokeylifecyclejava.error.RevokedVersionException;
 import com.github.lisama569.cryptokeylifecyclejava.error.UnknownVersionException;
+import com.github.lisama569.cryptokeylifecyclejava.error.VersionActiveException;
+import com.github.lisama569.cryptokeylifecyclejava.error.VersionDecommissionedException;
+import com.github.lisama569.cryptokeylifecyclejava.error.VersionStillReferencedException;
 import com.github.lisama569.cryptokeylifecyclejava.web.dto.Dtos;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,7 +23,8 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  * <ul>
  *   <li>INVALID_INPUT / 不可读请求体 → 400</li>
  *   <li>UNKNOWN_VERSION → 404</li>
- *   <li>REVOKED_VERSION / INTEGRITY_FAILURE / KEY_STATE_CONFLICT → 409</li>
+ *   <li>REVOKED_VERSION / INTEGRITY_FAILURE / KEY_STATE_CONFLICT /
+ *       VERSION_ACTIVE / VERSION_STILL_REFERENCED / VERSION_DECOMMISSIONED → 409</li>
  * </ul>
  * 错误响应仅包含机器可读的原因码与不含明文的描述。
  */
@@ -58,6 +62,21 @@ public class LifecycleExceptionHandler {
 
     @ExceptionHandler(KeyConflictException.class)
     public ResponseEntity<Dtos.ErrorResponse> handleConflict(KeyConflictException ex) {
+        return build(HttpStatus.CONFLICT, ex);
+    }
+
+    @ExceptionHandler(VersionActiveException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleVersionActive(VersionActiveException ex) {
+        return build(HttpStatus.CONFLICT, ex);
+    }
+
+    @ExceptionHandler(VersionStillReferencedException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleStillReferenced(VersionStillReferencedException ex) {
+        return build(HttpStatus.CONFLICT, ex);
+    }
+
+    @ExceptionHandler(VersionDecommissionedException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleDecommissioned(VersionDecommissionedException ex) {
         return build(HttpStatus.CONFLICT, ex);
     }
 

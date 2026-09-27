@@ -24,8 +24,11 @@ class RotationRollbackTest {
 
     private static final Logger log = LoggerFactory.getLogger(RotationRollbackTest.class);
 
-    /** 包装内存存储：当 PENDING 种子已写入、且调用次数达到阈值时，让旧版本状态更新失败一次。 */
-    private static final class FailOnceOnRetireStore implements KeyStore {
+    /**
+     * 包装内存存储：第一次轮换时，在“新版本 PENDING -> ACTIVE”这一步注入一次故障。
+     * 新切换顺序下旧版本尚未退役，回滚只需删除未完成的新版本，旧 ACTIVE 继续提供服务。
+     */
+    private static final class FailOnceOnActivateStore implements KeyStore {
         private final InMemoryKeyStore delegate = new InMemoryKeyStore();
         private final AtomicInteger updateCalls = new AtomicInteger();
         private volatile boolean armed = true;
@@ -36,14 +39,14 @@ class RotationRollbackTest {
         @Override public Optional<SecretKey> findKey(int version) { return delegate.findKey(version); }
         @Override public Optional<KeyVersion> current() { return delegate.current(); }
         @Override public List<KeyVersion> all() { return delegate.all(); }
-        @Override public void removeIfPending(int version) { delegate.removeIfPending(version); }
+        @Override public void removeUnfinishedVersion(int version) { delegate.removeUnfinishedVersion(version); }
 
         @Override
         public void updateState(KeyVersion meta) {
-            // 第一次轮换时，在“旧 ACTIVE -> RETIRED”这一步注入故障
-            if (armed && meta.state() == KeyState.RETIRED
+            // 第一次轮换时，在“新版本 PENDING -> ACTIVE”这一步注入故障
+            if (armed && meta.state() == KeyState.ACTIVE && meta.version() == 2
                     && updateCalls.incrementAndGet() == 1) {
-                throw new IllegalStateException("simulated storage outage during retire");
+                throw new IllegalStateException("simulated storage outage during activation");
             }
             delegate.updateState(meta);
         }
@@ -53,7 +56,7 @@ class RotationRollbackTest {
 
     @Test
     void failedRotationRollsBackWithNoHalfStateAndVersionCanBeReused() {
-        FailOnceOnRetireStore store = new FailOnceOnRetireStore();
+        FailOnceOnActivateStore store = new FailOnceOnActivateStore();
         KeyManager km = new KeyManager(store, new AesGcmCipher(12, 128), new CipherCodec(), 256);
         km.generateAndActivate();
         String before = km.encrypt("survives-rotation-failure");
@@ -61,7 +64,7 @@ class RotationRollbackTest {
         // 轮换在中途失败 → 调用方收到冲突异常
         assertThrows(KeyConflictException.class, km::rotate);
 
-        // 回滚后无半更新状态：v1 恢复 ACTIVE，没有第二个版本，唯一 ACTIVE 仍是 v1
+        // 回滚后无半更新状态：v1 仍 ACTIVE，没有第二个版本，唯一 ACTIVE 仍是 v1
         assertEquals(1, store.all().size());
         assertEquals(KeyState.ACTIVE, store.all().get(0).state());
         assertEquals(1, km.currentVersion().version());
@@ -79,6 +82,6 @@ class RotationRollbackTest {
         assertEquals("survives-rotation-failure", km.decrypt(before));
         assertEquals(2, km.encrypt("after-retry").startsWith("v2:") ? 2 : -1);
 
-        log.info("[rollback] version=1 op=ROTATE_FAILURE basis=RESTORE_ACTIVE_AND_DROP_PENDING result=PASS retriedTo=2");
+        log.info("[rollback] version=1 op=ROTATE_FAILURE basis=KEEP_ACTIVE_AND_DROP_UNFINISHED result=PASS retriedTo=2");
     }
 }

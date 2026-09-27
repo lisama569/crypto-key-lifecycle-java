@@ -4,9 +4,13 @@ import com.github.lisama569.cryptokeylifecyclejava.config.KeyLifecycleProperties
 import com.github.lisama569.cryptokeylifecyclejava.crypto.CipherCodec;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyManager;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyVersion;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.VersionDecommissionService;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.VersionReferenceReport;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.VersionReferenceService;
 import com.github.lisama569.cryptokeylifecyclejava.error.InvalidInputException;
 import com.github.lisama569.cryptokeylifecyclejava.migration.MigrationProgress;
 import com.github.lisama569.cryptokeylifecyclejava.migration.MigrationService;
+import com.github.lisama569.cryptokeylifecyclejava.migration.TargetedMigrationProgress;
 import com.github.lisama569.cryptokeylifecyclejava.web.dto.Dtos;
 import java.util.List;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -28,13 +32,19 @@ public class KeyLifecycleController {
 
     private final KeyManager keyManager;
     private final MigrationService migrationService;
+    private final VersionReferenceService versionReferenceService;
+    private final VersionDecommissionService versionDecommissionService;
     private final CipherCodec cipherCodec;
     private final KeyLifecycleProperties properties;
 
     public KeyLifecycleController(KeyManager keyManager, MigrationService migrationService,
+                                  VersionReferenceService versionReferenceService,
+                                  VersionDecommissionService versionDecommissionService,
                                   CipherCodec cipherCodec, KeyLifecycleProperties properties) {
         this.keyManager = keyManager;
         this.migrationService = migrationService;
+        this.versionReferenceService = versionReferenceService;
+        this.versionDecommissionService = versionDecommissionService;
         this.cipherCodec = cipherCodec;
         this.properties = properties;
     }
@@ -97,10 +107,45 @@ public class KeyLifecycleController {
         return migrationService.progress();
     }
 
+    /** 按来源版本定向清理一批数据，只处理该旧版本加密的记录。 */
+    @PostMapping("/migrate/version")
+    public TargetedMigrationProgress migrateVersion(@RequestParam int version,
+                                                    @RequestParam(required = false) Integer limit) {
+        Integer effectiveLimit = limit != null ? limit : properties.getMigrationBatchSize();
+        return migrationService.migrateVersion(version, effectiveLimit);
+    }
+
+    /** 查看某版本的实时引用统计与安全下线预检结论。 */
+    @GetMapping("/versions/{version}/references")
+    public VersionReferenceReport references(@org.springframework.web.bind.annotation.PathVariable int version) {
+        return versionReferenceService.inspect(version);
+    }
+
+    /** 安全下线预检（只判定，不改动任何状态）。 */
+    @PostMapping("/decommission/preflight")
+    public VersionReferenceReport decommissionPreflight(
+            @RequestBody(required = false) Dtos.DecommissionRequest request) {
+        if (request == null || request.version() == null) {
+            throw new InvalidInputException("field 'version' is required");
+        }
+        return versionDecommissionService.preflight(request.version());
+    }
+
+    /** 执行安全下线：仅当引用清零且非当前服务版本时成功。 */
+    @PostMapping("/decommission")
+    public Dtos.VersionView decommission(
+            @RequestBody(required = false) Dtos.DecommissionRequest request) {
+        if (request == null || request.version() == null) {
+            throw new InvalidInputException("field 'version' is required");
+        }
+        return toView(versionDecommissionService.decommission(request.version()));
+    }
+
     private static Dtos.VersionView toView(KeyVersion v) {
         return new Dtos.VersionView(v.version(), v.state().name(),
                 v.createdAt() == null ? null : v.createdAt().toString(),
                 v.retiredAt() == null ? null : v.retiredAt().toString(),
-                v.revokedAt() == null ? null : v.revokedAt().toString());
+                v.revokedAt() == null ? null : v.revokedAt().toString(),
+                v.decommissionedAt() == null ? null : v.decommissionedAt().toString());
     }
 }

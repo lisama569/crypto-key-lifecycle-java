@@ -16,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -73,36 +74,58 @@ class KeyManagerConcurrencyTest {
 
         int encryptors = 8;
         int rotators = 4;
-        int perEncryptor = 200;
+        int rounds = 4;
+        int perEncryptorPerRound = 50;
         ExecutorService pool = Executors.newFixedThreadPool(encryptors + rotators);
-        CountDownLatch start = new CountDownLatch(1);
         ConcurrentHashMap<String, String> produced = new ConcurrentHashMap<>();
         AtomicInteger failures = new AtomicInteger();
 
+        // 用 Phaser 把“一轮加密 + 并发轮换”交织为确定的 4 个阶段：每个阶段所有加密线程与
+        // 轮换线程同时起跑、彼此竞争，阶段结束前全部到达屏障。这样既保留真实并发，又保证
+        // 多个 ACTIVE 版本上都产生过数据，避免“轮换全部先完成”这类纯调度时序导致的偶发失败。
+        Phaser phaser = new Phaser(encryptors + rotators) {
+            @Override
+            protected boolean onAdvance(int phase, int registeredParties) {
+                return phase >= rounds - 1; // 完成 rounds 个阶段后终止
+            }
+        };
+
         for (int r = 0; r < rotators; r++) {
             pool.submit(() -> {
-                start.await();
-                km.rotate();
+                while (!phaser.isTerminated()) {
+                    int phase = phaser.arriveAndAwaitAdvance();
+                    if (phase < 0) {
+                        return null;
+                    }
+                    km.rotate();
+                    phaser.arriveAndAwaitAdvance(); // 等待本阶段加密线程完成后一起进入下一阶段
+                }
                 return null;
             });
         }
         for (int e = 0; e < encryptors; e++) {
             final int workerId = e;
             pool.submit(() -> {
-                start.await();
-                for (int i = 0; i < perEncryptor; i++) {
-                    try {
-                        String plain = "worker-" + workerId + "-msg-" + i;
-                        String cipher = km.encrypt(plain);
-                        produced.put(cipher, plain); // 密文随机 IV，键天然唯一
-                    } catch (RuntimeException ex) {
-                        failures.incrementAndGet();
+                int msgSeq = 0;
+                while (!phaser.isTerminated()) {
+                    int phase = phaser.arriveAndAwaitAdvance();
+                    if (phase < 0) {
+                        return null;
                     }
+                    for (int i = 0; i < perEncryptorPerRound; i++) {
+                        try {
+                            String plain = "worker-" + workerId + "-msg-" + (msgSeq++);
+                            String cipher = km.encrypt(plain);
+                            produced.put(cipher, plain); // 密文随机 IV，键天然唯一
+                        } catch (RuntimeException ex) {
+                            failures.incrementAndGet();
+                        }
+                    }
+                    phaser.arriveAndAwaitAdvance();
                 }
                 return null;
             });
         }
-        start.countDown();
         pool.shutdown();
         assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS));
 

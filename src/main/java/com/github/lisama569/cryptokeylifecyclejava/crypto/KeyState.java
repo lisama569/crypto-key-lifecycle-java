@@ -9,5 +9,7 @@ public enum KeyState {
     /** 已轮换、处于保留期内，仅允许解密历史数据。 */
     RETIRED,
     /** 已吊销，任何加解密操作一律拒绝。 */
-    REVOKED
+    REVOKED,
+    /** 已安全下线：引用清零且不再提供服务后的终态，仅保留审计元数据，拒绝任何加解密。 */
+    DECOMMISSIONED
 }

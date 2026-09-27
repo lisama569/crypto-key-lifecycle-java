@@ -5,6 +5,9 @@ import com.github.lisama569.cryptokeylifecyclejava.crypto.CipherCodec;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.InMemoryKeyStore;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyManager;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyStore;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.MaintenanceLock;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.VersionDecommissionService;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.VersionReferenceService;
 import com.github.lisama569.cryptokeylifecyclejava.migration.DataRepository;
 import com.github.lisama569.cryptokeylifecyclejava.migration.InMemoryDataRepository;
 import com.github.lisama569.cryptokeylifecyclejava.migration.MigrationService;
@@ -59,7 +62,28 @@ public class KeyLifecycleConfig {
     }
 
     @Bean
-    public MigrationService migrationService(KeyManager keyManager, DataRepository repository) {
-        return new MigrationService(keyManager, repository);
+    public MaintenanceLock maintenanceLock() {
+        return new MaintenanceLock();
+    }
+
+    @Bean
+    public MigrationService migrationService(KeyManager keyManager, DataRepository repository,
+                                             MaintenanceLock maintenanceLock) {
+        return new MigrationService(keyManager, repository, maintenanceLock);
+    }
+
+    @Bean
+    public VersionReferenceService versionReferenceService(KeyManager keyManager,
+                                                           DataRepository repository,
+                                                           MaintenanceLock maintenanceLock) {
+        return new VersionReferenceService(keyManager, repository, maintenanceLock);
+    }
+
+    @Bean
+    public VersionDecommissionService versionDecommissionService(KeyManager keyManager,
+                                                                 DataRepository repository,
+                                                                 MaintenanceLock maintenanceLock,
+                                                                 VersionReferenceService referenceService) {
+        return new VersionDecommissionService(keyManager, repository, maintenanceLock, referenceService);
     }
 }

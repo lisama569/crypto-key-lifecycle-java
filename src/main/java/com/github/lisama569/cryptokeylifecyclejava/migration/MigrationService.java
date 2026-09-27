@@ -2,9 +2,9 @@ package com.github.lisama569.cryptokeylifecyclejava.migration;
 
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyManager;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyVersion;
+import com.github.lisama569.cryptokeylifecyclejava.decommission.MaintenanceLock;
 import com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException;
 import java.util.List;
-import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,7 +19,9 @@ import org.slf4j.LoggerFactory;
  *       即返回进度；再次调用从剩余旧版本记录继续，无需从头开始；</li>
  *   <li><b>进度可核验</b>：{@link MigrationProgress} 含总数/已迁移/跳过/失败，
  *       {@code completed} 由实时扫描得出；</li>
- *   <li><b>并发安全</b>：迁移批次在服务级锁内串行；与在线加密/解密不互斥；</li>
+ *   <li><b>并发安全</b>：全量迁移与定向清理批次在共享 {@link MaintenanceLock} 内串行，
+ *       同一把锁也保护版本引用统计与安全下线，因此“引用清零判定”与数据改写互斥；
+ *       与在线加密/解密不互斥；</li>
  *   <li><b>失败安全</b>：源版本被吊销等失败只计入 failed 并保留原密文，
  *       不破坏数据，错误信息不含明文。</li>
  * </ul>
@@ -30,11 +32,17 @@ public class MigrationService {
 
     private final KeyManager keyManager;
     private final DataRepository repository;
-    private final ReentrantLock migrationLock = new ReentrantLock();
+    private final MaintenanceLock maintenanceLock;
 
     public MigrationService(KeyManager keyManager, DataRepository repository) {
+        this(keyManager, repository, new MaintenanceLock());
+    }
+
+    public MigrationService(KeyManager keyManager, DataRepository repository,
+                            MaintenanceLock maintenanceLock) {
         this.keyManager = keyManager;
         this.repository = repository;
+        this.maintenanceLock = maintenanceLock;
     }
 
     /**
@@ -46,7 +54,7 @@ public class MigrationService {
         KeyVersion target = keyManager.currentVersion();
         int targetVersion = target.version();
 
-        migrationLock.lock();
+        maintenanceLock.lock();
         try {
             List<DataRecord> snapshot = repository.findAll();
             int total = snapshot.size();
@@ -87,7 +95,74 @@ public class MigrationService {
                     oldestFrom, targetVersion, total, migrated, skipped, failed, progress.completed());
             return progress;
         } finally {
-            migrationLock.unlock();
+            maintenanceLock.unlock();
+        }
+    }
+
+    /**
+     * 按来源版本定向清理：只把指定旧版本的记录重加密到当前 ACTIVE 版本。
+     *
+     * <p>与全量迁移相同的保证：幂等（候选仅按“密文版本 == sourceVersion 且 != 当前版本”
+     * 判定）、可中断续跑（每条独立 CAS 提交，处理到 {@code limit} 即返回）、失败保留原密文。
+     * 与安全下线共用 {@link com.github.lisama569.cryptokeylifecyclejava.decommission.MaintenanceLock}，
+     * 因而清理期间下线门禁看到的引用数一定与实际数据一致。
+     *
+     * @param sourceVersion 只处理该版本加密的记录；未知版本抛 UNKNOWN_VERSION
+     * @param limit         本批最多处理条数；null 或 &lt;=0 表示全部
+     */
+    public TargetedMigrationProgress migrateVersion(int sourceVersion, Integer limit) {
+        // 未知来源版本先拒绝（在锁外做存在性校验也安全，状态/引用判定仍在锁内）
+        keyManager.getVersion(sourceVersion);
+        KeyVersion target = keyManager.currentVersion();
+        int targetVersion = target.version();
+        if (sourceVersion == targetVersion) {
+            // 当前服务版本不可能也不需要“清理到自身”：其数据是新数据而非历史数据
+            throw new com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException(
+                    "source version " + sourceVersion + " is the current active version; nothing to clean up");
+        }
+
+        maintenanceLock.lock();
+        try {
+            List<DataRecord> snapshot = repository.findAll();
+            int totalAtStart = (int) snapshot.stream()
+                    .filter(r -> r.keyVersion() == sourceVersion).count();
+            int migrated = 0;
+            int skipped = 0;
+            int failed = 0;
+
+            for (DataRecord record : snapshot) {
+                if (record.keyVersion() != sourceVersion) {
+                    continue; // 只处理指定来源版本，其它代旧版本完全不受影响
+                }
+                if (limit != null && limit > 0 && (migrated + failed) >= limit) {
+                    break; // 批量边界：该来源版本剩余记录下次续跑
+                }
+                try {
+                    migrateOne(record, targetVersion);
+                    migrated++;
+                    log.info("op=TARGETED_CLEANUP result=ACCEPT basis=RE_ENCRYPTED id={} fromVersion={} toVersion={}",
+                            record.id(), sourceVersion, targetVersion);
+                } catch (AlreadyMigratedException e) {
+                    skipped++;
+                    log.info("op=TARGETED_CLEANUP result=SKIP basis=ALREADY_MIGRATED id={} fromVersion={}",
+                            record.id(), sourceVersion);
+                } catch (KeyLifecycleException e) {
+                    failed++;
+                    log.warn("op=TARGETED_CLEANUP result=FAIL basis={} id={} fromVersion={} toVersion={}",
+                            e.reasonCode(), record.id(), sourceVersion, targetVersion);
+                }
+            }
+
+            long remaining = repository.findAll().stream()
+                    .filter(r -> r.keyVersion() == sourceVersion).count();
+            TargetedMigrationProgress progress = new TargetedMigrationProgress(
+                    sourceVersion, targetVersion, totalAtStart,
+                    migrated, skipped, failed, (int) remaining, remaining == 0);
+            log.info("op=TARGETED_CLEANUP_BATCH result=DONE basis=PROGRESS fromVersion={} toVersion={} migrated={} skipped={} failed={} remaining={} completed={}",
+                    sourceVersion, targetVersion, migrated, skipped, failed, remaining, progress.completed());
+            return progress;
+        } finally {
+            maintenanceLock.unlock();
         }
     }
 

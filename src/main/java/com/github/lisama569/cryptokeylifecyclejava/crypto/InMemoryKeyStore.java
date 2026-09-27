@@ -78,9 +78,10 @@ public class InMemoryKeyStore implements KeyStore {
     }
 
     @Override
-    public synchronized void removeIfPending(int version) {
+    public synchronized void removeUnfinishedVersion(int version) {
         Entry entry = entries.get(version);
-        if (entry != null && entry.meta().state() == KeyState.PENDING) {
+        if (entry != null && (entry.meta().state() == KeyState.PENDING
+                || entry.meta().state() == KeyState.ACTIVE)) {
             entries.remove(version);
         }
     }

@@ -8,6 +8,7 @@ public record KeyVersion(
         KeyState state,
         Instant createdAt,
         Instant retiredAt,
-        Instant revokedAt
+        Instant revokedAt,
+        Instant decommissionedAt
 ) {
 }
