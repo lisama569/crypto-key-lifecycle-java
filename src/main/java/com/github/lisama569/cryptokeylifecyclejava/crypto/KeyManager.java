@@ -2,13 +2,14 @@ package com.github.lisama569.cryptokeylifecyclejava.crypto;
 
 import com.github.lisama569.cryptokeylifecyclejava.error.InvalidInputException;
 import com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException;
+import com.github.lisama569.cryptokeylifecyclejava.error.RotationRecoveryException;
 import com.github.lisama569.cryptokeylifecyclejava.error.RevokedVersionException;
 import com.github.lisama569.cryptokeylifecyclejava.error.UnknownVersionException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import javax.crypto.SecretKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -25,11 +26,18 @@ import org.slf4j.LoggerFactory;
  *
  * <p>并发与原子性语义：
  * <ul>
- *   <li>{@code lifecycleLock} 保证“生成新密钥 + 旧版本转 RETIRED + 新版本 ACTIVE”整体原子，
- *       并发轮换被串行化；轮换流程中任何异常都会在锁内回滚本次变更，不留半更新状态；</li>
- *   <li>加密始终读取当下唯一的 ACTIVE 版本，轮换后新数据只使用新版本；</li>
- *   <li>解密允许 ACTIVE 与保留期内的 RETIRED 版本，REVOKED 一律拒绝；</li>
- *   <li>同一版本不会被重复启用（put 拒绝重复版本号，状态机不允许逆向转换）。</li>
+ *   <li>使用一把公平的读写锁 {@code lifecycleLock}：轮换/生成/吊销/下线等状态变更持<b>写锁</b>，
+ *       在线加密持<b>读锁</b>。轮换内部“写入 PENDING → 旧版本转 RETIRED → 新版本转 ACTIVE”
+ *       三步对外是<b>一个不可见的原子临界区</b>——外部任何时刻读到的版本视图都恰好有一个
+ *       ACTIVE，不存在“没有可用版本”的空窗；因此在线加密与轮换可真正并发且永不因轮换失败。
+ *       并发轮换被写锁串行化；同一版本不会被重复启用（put 拒绝重复版本号，状态机不允许逆向转换）。</li>
+ *   <li>解密不需要锁：轮换中间态下旧版本是 RETIRED（保留期内允许解密）、新版本 PENDING
+ *       不会出现在任何已产出的信封里，所以按信封版本读到的状态在解密语义上始终自洽，
+ *       轮换不会阻塞历史数据解密。</li>
+ *   <li>轮换流程中任何异常都在写锁内回滚本次变更（恢复旧版本 ACTIVE、移除未启用的 PENDING），
+ *       不留半更新状态；干净回滚以 {@link KeyConflictException} 表达。若回滚本身失败或回滚后
+ *       不满足“仍有（且仅有）一个 ACTIVE、无 PENDING 残留”的不变式，则抛出
+ *       {@link RotationRecoveryException}（{@code ROTATION_RECOVERY_FAILED}），与普通冲突可区分。</li>
  * </ul>
  */
 public class KeyManager {
@@ -43,7 +51,8 @@ public class KeyManager {
     private final AesGcmCipher cipher;
     private final CipherCodec codec;
     private final int keyBits;
-    private final ReentrantLock lifecycleLock = new ReentrantLock();
+    // 公平锁：轮换在临界区内排队时，先到的在线加密优先拿到读锁完成，避免写线程长期插队饿死写入
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock(true);
 
     public KeyManager(KeyStore keyStore, AesGcmCipher cipher, CipherCodec codec) {
         this(keyStore, cipher, codec, 256);
@@ -58,7 +67,7 @@ public class KeyManager {
 
     /** 生成首个密钥版本并直接启用；若已有 ACTIVE 版本则拒绝（避免重复启用）。 */
     public KeyVersion generateAndActivate() {
-        lifecycleLock.lock();
+        lifecycleLock.writeLock().lock();
         try {
             Optional<KeyVersion> existing = keyStore.current();
             if (existing.isPresent()) {
@@ -75,7 +84,7 @@ public class KeyManager {
                     version, meta.state());
             return meta;
         } finally {
-            lifecycleLock.unlock();
+            lifecycleLock.writeLock().unlock();
         }
     }
 
@@ -84,7 +93,7 @@ public class KeyManager {
      * 返回新版本元数据。无 ACTIVE 版本时先初始化（与 generateAndActivate 互斥，不会重复）。
      */
     public RotationResult rotate() {
-        lifecycleLock.lock();
+        lifecycleLock.writeLock().lock();
         try {
             KeyVersion current = keyStore.current().orElse(null);
             int newVersionNumber = keyStore.nextVersion();
@@ -111,8 +120,9 @@ public class KeyManager {
                         current == null ? -1 : current.version(), newVersionNumber);
                 return new RotationResult(current == null ? -1 : current.version(), active);
             } catch (RuntimeException ex) {
-                // 回滚：清除可能已写入的 PENDING 新版本；旧版本若已被转 RETIRED 则恢复 ACTIVE
-                rollbackAfterFailedRotate(current, newMeta);
+                // 回滚：清除可能已写入的 PENDING 新版本；旧版本若已被转 RETIRED 则恢复 ACTIVE。
+                // 回滚后必须回到轮换前的一致视图（有在用版本、无半更新），否则抛出可区分的恢复失败。
+                rollbackAfterFailedRotate(current, newMeta, newVersionNumber);
                 if (ex instanceof com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException) {
                     throw ex;
                 }
@@ -121,31 +131,57 @@ public class KeyManager {
                 throw new KeyConflictException("key rotation failed and was rolled back");
             }
         } finally {
-            lifecycleLock.unlock();
+            lifecycleLock.writeLock().unlock();
         }
     }
 
-    private void rollbackAfterFailedRotate(KeyVersion previousActive, KeyVersion pendingNew) {
+    /**
+     * 回滚一次失败的轮换并校验恢复后的不变式。
+     *
+     * @param previousActive 轮换开始前的在用版本（首次轮换为 null）
+     * @param pendingNew     本次可能已写入的 PENDING 新版本（可能为 null）
+     * @param intendedVersion 本次轮换打算启用的版本号（仅用于日志）
+     * @throws RotationRecoveryException 回滚动作本身失败，或回滚后仍无在用版本 / 残留 PENDING
+     */
+    private void rollbackAfterFailedRotate(KeyVersion previousActive, KeyVersion pendingNew, int intendedVersion) {
+        RuntimeException recoveryError = null;
+        // 旧版本若已被转 RETIRED，恢复为 ACTIVE；新种子版本从未启用，直接移除，版本链不留废版本
         try {
-            // 旧版本若已被转 RETIRED，恢复为 ACTIVE
             if (previousActive != null && keyStore.find(previousActive.version())
                     .map(m -> m.state() == KeyState.RETIRED).orElse(false)) {
                 keyStore.updateState(previousActive);
             }
-            // 新种子版本从未启用，直接移除，版本链不留废版本；下一次轮换复用该版本号
             if (pendingNew != null) {
                 keyStore.removeIfPending(pendingNew.version());
             }
         } catch (RuntimeException rollbackError) {
+            recoveryError = rollbackError;
             log.error("op=ROTATE result=ROLLBACK_ERROR version={} error={}",
-                    pendingNew == null ? -1 : pendingNew.version(),
-                    rollbackError.getClass().getSimpleName());
+                    intendedVersion, rollbackError.getClass().getSimpleName());
+        }
+
+        // 恢复后不变式：首次轮换失败应回到“空系统”；否则必须恰好有一个 ACTIVE 且无 PENDING 残留
+        long activeCount = keyStore.all().stream().filter(m -> m.state() == KeyState.ACTIVE).count();
+        long pendingCount = keyStore.all().stream().filter(m -> m.state() == KeyState.PENDING).count();
+        boolean consistent = previousActive == null
+                ? activeCount == 0 && pendingCount == 0
+                : activeCount == 1 && pendingCount == 0
+                    && keyStore.find(previousActive.version())
+                            .map(m -> m.state() == KeyState.ACTIVE).orElse(false);
+        if (!consistent || recoveryError != null) {
+            String msg = "key rotation failed at version " + intendedVersion
+                    + " and recovery left the key set in an unsafe state"
+                    + " (active=" + activeCount + ", pending=" + pendingCount + ")";
+            if (recoveryError != null) {
+                throw new RotationRecoveryException(msg + ": " + recoveryError.getMessage(), recoveryError);
+            }
+            throw new RotationRecoveryException(msg);
         }
     }
 
     /** 吊销指定版本（ACTIVE 或 RETIRED 可吊销；未知/已吊销分别给出可区分原因）。 */
     public KeyVersion revoke(int version) {
-        lifecycleLock.lock();
+        lifecycleLock.writeLock().lock();
         try {
             KeyVersion current = requireVersion(version, "REVOKE");
             return switch (current.state()) {
@@ -169,7 +205,7 @@ public class KeyManager {
                 }
             };
         } finally {
-            lifecycleLock.unlock();
+            lifecycleLock.writeLock().unlock();
         }
     }
 
@@ -191,7 +227,7 @@ public class KeyManager {
      * @param referenceCount  实时引用统计（在锁内求值，保证判定与转换之间无并发漂移）
      */
     public KeyVersion decommission(int version, java.util.function.IntSupplier referenceCount) {
-        lifecycleLock.lock();
+        lifecycleLock.writeLock().lock();
         try {
             KeyVersion current = requireVersion(version, "DECOMMISSION");
             switch (current.state()) {
@@ -231,33 +267,47 @@ public class KeyManager {
                 default -> throw new IllegalStateException("unhandled state: " + current.state());
             }
         } finally {
-            lifecycleLock.unlock();
+            lifecycleLock.writeLock().unlock();
         }
     }
 
-    /** 使用当前 ACTIVE 版本加密。null/空明文被拒绝，绝不返回错误明文。 */
+    /**
+     * 使用当前 ACTIVE 版本加密。null/空明文被拒绝，绝不返回错误明文。
+     *
+     * <p>持读锁：与轮换等状态变更互斥、与其他并发加密共享。因此调用方看到的版本视图要么是
+     * 切换前的旧 ACTIVE、要么是切换后的新 ACTIVE，绝不会看到“没有可用版本”的轮换中间态，
+     * 在线写入不会因为轮换而失败。
+     */
     public String encrypt(String plaintext) {
         if (plaintext == null || plaintext.isEmpty()) {
             log.warn("op=ENCRYPT result=REJECT basis=EMPTY_INPUT");
             throw new InvalidInputException("plaintext must not be null or empty");
         }
-        KeyVersion active = keyStore.current().orElseThrow(() -> {
-            log.error("op=ENCRYPT result=REJECT basis=NO_ACTIVE_VERSION");
-            return new KeyConflictException("no active key version available");
-        });
-        SecretKey key = keyStore.findKey(active.version())
-                .orElseThrow(() -> new IllegalStateException("active key material missing"));
-        byte[] data = plaintext.getBytes(StandardCharsets.UTF_8);
-        CiphertextEnvelope envelope = cipher.encrypt(key, active.version(), data);
-        log.debug("op=ENCRYPT result=ACCEPT basis=ACTIVE_VERSION version={}", active.version());
-        return codec.encode(envelope);
+        lifecycleLock.readLock().lock();
+        try {
+            KeyVersion active = keyStore.current().orElseThrow(() -> {
+                log.error("op=ENCRYPT result=REJECT basis=NO_ACTIVE_VERSION");
+                return new KeyConflictException("no active key version available");
+            });
+            SecretKey key = keyStore.findKey(active.version())
+                    .orElseThrow(() -> new IllegalStateException("active key material missing"));
+            byte[] data = plaintext.getBytes(StandardCharsets.UTF_8);
+            CiphertextEnvelope envelope = cipher.encrypt(key, active.version(), data);
+            log.debug("op=ENCRYPT result=ACCEPT basis=ACTIVE_VERSION version={}", active.version());
+            return codec.encode(envelope);
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
     }
 
     /**
-     * 按信封中的版本号解密：
+     * 按信封中的版本号解密（不持生命周期锁）：
      * 未知版本 → {@link UnknownVersionException}；
      * 已吊销版本 → {@link RevokedVersionException}；
      * 篡改/标签失败 → {@link IntegrityVerificationException}（由底层原语抛出）。
+     *
+     * <p>轮换中间态对解密也是安全的：旧版本处于 RETIRED（保留期内允许解密），
+     * PENDING 新版本尚未产生任何信封，因此不会被任何密文引用，轮换不会阻塞或破坏历史数据解密。
      */
     public String decrypt(String encodedCiphertext) {
         CiphertextEnvelope envelope = codec.decode(encodedCiphertext);

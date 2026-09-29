@@ -75,7 +75,8 @@ public class KeyLifecycleController {
             throw new InvalidInputException("request body is required");
         }
         String ciphertext = keyManager.encrypt(request.plaintext());
-        int version = keyManager.currentVersion().version();
+        // 版本号直接取自密文信封本身，避免“加密后再查当前版本”与轮换竞跑导致响应字段与密文不一致
+        int version = cipherCodec.decode(ciphertext).keyVersion();
         return new Dtos.EncryptResponse(ciphertext, version);
     }
 

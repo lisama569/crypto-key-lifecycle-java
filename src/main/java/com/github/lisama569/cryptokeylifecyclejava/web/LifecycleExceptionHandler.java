@@ -73,6 +73,14 @@ public class LifecycleExceptionHandler {
         return build(HttpStatus.CONFLICT, ex);
     }
 
+    /** 轮换失败后回滚又失败（或回滚后无在用版本）：属于需介入的服务端故障，返回 500。 */
+    @ExceptionHandler(com.github.lisama569.cryptokeylifecyclejava.error.RotationRecoveryException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleRotationRecovery(
+            com.github.lisama569.cryptokeylifecyclejava.error.RotationRecoveryException ex) {
+        log.error("op=HTTP result=ERROR basis=ROTATION_RECOVERY_FAILED");
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, ex);
+    }
+
     /** 兜底：任何未预期异常返回 500 且不含内部细节，避免泄露明文或堆栈。 */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Dtos.ErrorResponse> handleUnexpected(Exception ex) {

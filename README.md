@@ -2,9 +2,10 @@
 
 一套完全运行在本地的密钥生命周期管理能力：密钥受**版本标识**管理，支持生成、启用、
 轮换、吊销以及历史数据迁移；在此之上提供**版本引用统计、按来源版本定向清理与
-受门禁保护的安全下线**，让旧版本的下线从人工判断变成可核验的闭环。轮换期间加解密
-可并发执行，异常输入、并发冲突与数据篡改均有**可区分的失败原因**，不返回错误明文、
-不留半更新状态。
+受门禁保护的安全下线**，让旧版本的下线从人工判断变成可核验的闭环。轮换通过读写锁
+对在线服务呈现为**一次原子版本切换**：轮换进行中可并发加解密，任何时刻都恰好有一个
+在用版本，写入绝不会因为轮换而失败；异常输入、并发冲突、轮换回滚失败与数据篡改均有
+**可区分的失败原因**，不返回错误明文、不留半更新状态。
 
 - 运行环境：Java 21+、Spring Boot 3.4、JUnit 5
 - 外部依赖：**无**。仅依赖 JDK 密码学原语（AES/GCM）与 Spring/Web、测试框架；
@@ -40,10 +41,13 @@
 
 1. 任意时刻最多只有一个 `ACTIVE`；重复初始化（`generateAndActivate`）被拒绝
    （`KEY_STATE_CONFLICT`），同一版本不会被重复启用。
-2. `rotate()` 原子完成三步：写入新版本 `PENDING` → 旧 `ACTIVE` 转 `RETIRED`
-   → 新版本转 `ACTIVE`。全程持有生命周期锁，并发轮换被**串行化**；中途异常会回滚
-   （旧版本恢复 `ACTIVE`，未启用的新版本标记 `REVOKED` 作为废版本审计痕迹），
-   不会留下半更新状态。
+2. `rotate()` 在**写锁**内完成三步：写入新版本 `PENDING` → 旧 `ACTIVE` 转 `RETIRED`
+   → 新版本转 `ACTIVE`。这三步对外是一个不可见的原子临界区：在线加密持**读锁**，
+   只能看到切换前的旧 `ACTIVE` 或切换后的新 `ACTIVE`，绝不会看到中间“没有在用版本”
+   的空窗；并发轮换被写锁串行化。中途异常会在同一把写锁内回滚（旧版本恢复 `ACTIVE`，
+   未启用的 `PENDING` 种子被移除、版本号下次复用），不留半更新状态；干净回滚返回
+   `KEY_STATE_CONFLICT`。若回滚动作本身失败、或回滚后不满足“仍有且仅有一个在用版本、
+   无 PENDING 残留”，则返回可区分的 `ROTATION_RECOVERY_FAILED`（HTTP 500）。
 3. `REVOKED` 是终态：重复吊销返回 `REVOKED_VERSION`；吊销未知版本返回
    `UNKNOWN_VERSION`，两者可区分。
 
@@ -69,6 +73,7 @@ v<密钥版本号>:<base64url(IV)>:<base64url(GCM 密文+认证标签)>
 | `KEY_STATE_CONFLICT` | 重复初始化、无 ACTIVE 时加密、并发状态冲突、清理当前 ACTIVE 版本 | 409 |
 | `VERSION_STILL_REFERENCED` | 安全下线时版本仍被数据记录引用 | 409 |
 | `VERSION_IS_ACTIVE` | 安全下线当前正在提供服务的 ACTIVE 版本 | 409 |
+| `ROTATION_RECOVERY_FAILED` | 轮换中途失败后的回滚本身又失败，或回滚后不再有在用版本/残留 PENDING（需人工介入） | 500 |
 
 异常输入不会导致服务不可用（拒绝后后续请求正常），错误响应形如
 `{"error":"REVOKED_VERSION","message":"..."}`，**不含任何明文或密文片段**。
@@ -79,9 +84,67 @@ v<密钥版本号>:<base64url(IV)>:<base64url(GCM 密文+认证标签)>
 
 ## 3. 轮换语义（服务持续运行）
 
-- 轮换与在线加密/解密不互斥：加密始终读取当下唯一 `ACTIVE`，轮换后新数据只使用新版本；
+轮换与在线加解密**不互斥**，由 `KeyManager` 内一把公平的读写锁保证：
+
+- 轮换、生成、吊销、安全下线等状态变更持**写锁**，彼此串行；在线加密持**读锁**，
+  多个加密互相并行。轮换内部“PENDING 落库 → 旧版本转 RETIRED → 新版本转 ACTIVE”
+  三步整体处在写锁临界区内，因此外部任何时刻读到的版本视图都**恰好有一个 ACTIVE**，
+  不存在“没有可用密钥版本”的窗口。轮换进行中的加密要么用切换前的旧版本、要么用
+  切换后的新版本，**绝不会失败**；轮换结束后的新数据一律使用新版本。锁是公平的，
+  排队的加密请求不会被持续到来的轮换饿死。
+- 在线**解密不持锁**：轮换临界区里旧版本处于 `RETIRED`（保留期内允许解密），
+  新 `PENDING` 版本还没有任何密文引用它，所以按信封版本读到的状态在解密语义上
+  始终自洽，轮换不阻塞、不破坏历史数据解密。
 - 轮换前产生的数据携带旧版本号，只要旧版本处于 `RETIRED` 保留期内，解密照常工作；
-- 连续多次轮换后，整条 `RETIRED` 链上的历史数据在被吊销前都可正确解密。
+  连续多次轮换后，整条 `RETIRED` 链上的历史数据在被吊销前都可正确解密。
+- 失败语义：轮换中途写状态失败时，系统在同一把写锁内回滚到轮换前视图——旧版本
+  恢复 `ACTIVE`、未启用的种子被移除，回滚后仍有一个可用在用版本，历史数据照常
+  可解，调用方可立即用同一版本号重试；这种“失败但已干净回滚”返回
+  `KEY_STATE_CONFLICT`(409)。仅当回滚本身也失败、或回滚后状态不满足
+  “恰好一个 ACTIVE 且无 PENDING 残留”时，才返回 `ROTATION_RECOVERY_FAILED`(500)，
+  与普通轮换失败严格可区分。
+
+### 3.1 本地验证“轮换期间并发写入不失败”
+
+确定性的时序由自动化测试覆盖（不靠调度碰运气）：测试用一个可在轮换中间点
+（旧版本已 `RETIRED`、新版本仍 `PENDING`）精确挂起轮换线程的存储包装，把空窗窗口
+钉死再发起并发读写：
+
+```bash
+# 轮换 vs 在线写入：切换原子可见、无 NO_ACTIVE_VERSION、跨版本密文均可解
+mvn test -Dtest=RotationConcurrencyTest
+
+# 轮换中途失败（retire/activate 两步分别注入）回滚、回滚本身失败原因可区分
+mvn test -Dtest=RotationRollbackTest
+
+# 大量并发轮换 + 并发加解密交错：串行化、唯一 ACTIVE、无重复启用
+mvn test -Dtest=KeyManagerConcurrencyTest
+```
+
+- `RotationConcurrencyTest.encryptionHasNoNoActiveVersionWindowDuringRotation`：
+  轮换停在中间点时，并发加密在旧实现下会立刻以 `KEY_STATE_CONFLICT` 失败（该用例在
+  修复前稳定复现），修复后调用在锁上等待、放行后成功且使用新版本；轮换前数据
+  在窗口期仍可即时解密。
+- `...repeatedRotationsInterleavedWithWritersNeverLoseAnActiveVersion`：
+  首轮轮换停在中间点、8 个写入线程持续写（共 2400 条），放行后再交错多轮轮换，
+  断言零失败、每条密文可按信封版本解开、最终恰好一个在用版本且版本号不重复。
+- `RotationRollbackTest` 额外覆盖在最后“新版本→ACTIVE”一步失败时仍干净回滚，
+  以及回滚动作本身失败时抛出 `ROTATION_RECOVERY_FAILED` 且保留底层原因。
+
+也可以手工压测（开两个终端，一边持续轮换、一边持续加密，加密侧不应出现非 2xx）：
+
+```bash
+mvn spring-boot:run
+
+# 终端 A：高频轮换
+while true; do curl -s -XPOST localhost:8080/api/keys/rotate >/dev/null; done
+
+# 终端 B：高频加密；修复后不会出现 {"error":"KEY_STATE_CONFLICT",...}
+while true; do
+  curl -s -XPOST localhost:8080/api/keys/encrypt \
+    -H 'Content-Type: application/json' -d '{"plaintext":"hello"}'
+done
+```
 
 ## 4. 吊销与历史数据迁移
 
@@ -252,6 +315,20 @@ curl -s -XPOST localhost:8080/api/keys/decommission -H 'Content-Type: applicatio
 - `WebDecommissionApiTest`：统计/定向清理/下线全 REST 走查，失败原因与
   HTTP 状态码一一对应。
 
+本轮轮换并发修复的核验路径：
+
+- `RotationConcurrencyTest`：用可在轮换中间点挂起的存储包装，确定性地验证轮换期间
+  并发加密不会撞到“没有在用版本”窗口（修复前稳定复现失败）、切换前后密文均可用
+  对应版本解开、解密轮换前历史数据不受影响；并在首轮轮换停在中间点的前提下让
+  8 个写入线程与多轮轮换交错（2400 条消息），断言零失败、版本不重复、终态唯一 ACTIVE；
+- `RotationRollbackTest`：在“旧版本转 RETIRED”和“新版本转 ACTIVE”两步分别注入故障，
+  验证干净回滚（恢复唯一 ACTIVE、移除 PENDING、版本号可复用、历史数据可解、可立即
+  重试）；再注入“回滚动作本身失败”，断言抛出与普通冲突可区分的
+  `ROTATION_RECOVERY_FAILED` 且保留底层原因；
+- `KeyManagerConcurrencyTest`：16 线程并发轮换串行化、版本不重复、唯一 ACTIVE；
+  轮换与加解密并发的用例改为屏障驱动（切换前确定写 v1、切换后排队写入确定用 v2），
+  不再依赖线程调度偶发覆盖多版本。
+
 ## 8. 关键配置项（`application.properties`）
 
 | 配置键 | 默认值 | 说明 |
@@ -265,14 +342,16 @@ curl -s -XPOST localhost:8080/api/keys/decommission -H 'Content-Type: applicatio
 ## 9. 测试与日志
 
 ```bash
-mvn test            # 全离线运行，共 46 个用例
+mvn test            # 全离线运行，共 51 个用例
 ```
 
 覆盖场景：AES/GCM 往返与随机 IV、密文篡改/IV 篡改/错误密钥、信封畸形输入、
 密钥状态机、**并发轮换**（16 线程串行化、唯一 ACTIVE、无重复版本）、
-**轮换与加解密并发**（约 1600 条消息全部可解、版本均合法）、**迁移中断续跑/幂等/
-跨轮换续跑/吊销源版本失败隔离**、**并发迁移收敛**、数据篡改端到端拒绝、
-**版本引用统计与下线预检**、**安全下线门禁与重复/并发拒绝**、
+**轮换与加解密并发**（屏障钉住切换窗口：写入零失败、切换前后密文均可解、
+约 2400 条消息跨版本全部可解）、**轮换中途失败回滚**（retire/activate 两步故障、
+干净回滚可重试）与**回滚本身失败的可区分原因**（ROTATION_RECOVERY_FAILED）、
+**迁移中断续跑/幂等/跨轮换续跑/吊销源版本失败隔离**、**并发迁移收敛**、
+数据篡改端到端拒绝、**版本引用统计与下线预检**、**安全下线门禁与重复/并发拒绝**、
 **千条级定向清理中断续跑与多代收敛**、**下线与清理并发竞争**，
 以及 REST 层状态码与原因码的区分。
 
@@ -289,13 +368,13 @@ result=<PASS|REJECTED|...>，失败时带 reason=<原因码>
 ```text
 crypto/    AesGcmCipher(加解密原语) CipherCodec(信封编解码)
            KeyVersion/KeyState(版本与状态) KeyStore/InMemoryKeyStore(线程安全存储)
-           KeyManager(生命周期门面：状态机/原子轮换/加解密判定/下线门禁)
+           KeyManager(生命周期门面：读写锁原子轮换/加解密判定/下线门禁/失败回滚)
 migration/ DataRecord/RecordStatus DataRepository(含 CAS 提交)
            MigrationService(全量+按来源版本定向清理) MigrationProgress/SourceCleanupProgress
 lifecycle/ VersionLifecycleService(引用统计/下线预检/安全下线编排) VersionReferenceStats
-error/     七类可区分异常（UNKNOWN_VERSION / REVOKED_VERSION /
+error/     八类可区分异常（UNKNOWN_VERSION / REVOKED_VERSION /
            INTEGRITY_FAILURE / INVALID_INPUT / KEY_STATE_CONFLICT /
-           VERSION_STILL_REFERENCED / VERSION_IS_ACTIVE）
+           VERSION_STILL_REFERENCED / VERSION_IS_ACTIVE / ROTATION_RECOVERY_FAILED）
 config/    KeyLifecycleProperties + Spring 本地装配（启动自动启用 v1）
 web/       REST 控制器与统一异常处理（原因码 → HTTP 状态码，错误体无明文）
 ```
