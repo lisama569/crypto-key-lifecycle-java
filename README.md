@@ -40,10 +40,13 @@
 
 1. 任意时刻最多只有一个 `ACTIVE`；重复初始化（`generateAndActivate`）被拒绝
    （`KEY_STATE_CONFLICT`），同一版本不会被重复启用。
-2. `rotate()` 原子完成三步：写入新版本 `PENDING` → 旧 `ACTIVE` 转 `RETIRED`
-   → 新版本转 `ACTIVE`。全程持有生命周期锁，并发轮换被**串行化**；中途异常会回滚
-   （旧版本恢复 `ACTIVE`，未启用的新版本标记 `REVOKED` 作为废版本审计痕迹），
-   不会留下半更新状态。
+2. `rotate()` 在存储的**同一次原子更新**内完成切换：先写入新版本 `PENDING` 种子，
+   再在同一个存储临界区内完成“旧 `ACTIVE` → `RETIRED` 与新版本 → `ACTIVE`”。
+   并发轮换被生命周期锁**串行化**；并发加密不取生命周期锁，但与切换共用存储
+   monitor，只能观察到“切换前（旧版本 ACTIVE）”或“切换后（新版本 ACTIVE）”，
+   **不存在“没有可用密钥版本”的窗口**。切换提交中途若存储失败，存储层在释放锁前
+   自愈（旧版本恢复 `ACTIVE`），门面再移除未启用的 `PENDING` 种子，版本号可复用；
+   不会留下半更新状态（详见第 3 节）。
 3. `REVOKED` 是终态：重复吊销返回 `REVOKED_VERSION`；吊销未知版本返回
    `UNKNOWN_VERSION`，两者可区分。
 
@@ -67,6 +70,7 @@ v<密钥版本号>:<base64url(IV)>:<base64url(GCM 密文+认证标签)>
 | `REVOKED_VERSION` | 使用已吊销版本加密/解密、重复吊销、重复/并发落败的安全下线 | 409 |
 | `INTEGRITY_FAILURE` | GCM 标签校验失败（数据被篡改/密钥不匹配） | 409 |
 | `KEY_STATE_CONFLICT` | 重复初始化、无 ACTIVE 时加密、并发状态冲突、清理当前 ACTIVE 版本 | 409 |
+| `ROTATION_FAILED` | 轮换在原子切换提交阶段被存储故障打断（已在锁内回滚，旧 ACTIVE 恢复可用，历史数据仍可解） | 500 |
 | `VERSION_STILL_REFERENCED` | 安全下线时版本仍被数据记录引用 | 409 |
 | `VERSION_IS_ACTIVE` | 安全下线当前正在提供服务的 ACTIVE 版本 | 409 |
 
@@ -79,9 +83,62 @@ v<密钥版本号>:<base64url(IV)>:<base64url(GCM 密文+认证标签)>
 
 ## 3. 轮换语义（服务持续运行）
 
-- 轮换与在线加密/解密不互斥：加密始终读取当下唯一 `ACTIVE`，轮换后新数据只使用新版本；
-- 轮换前产生的数据携带旧版本号，只要旧版本处于 `RETIRED` 保留期内，解密照常工作；
+- **轮换与在线加密/解密真正不互斥**：轮换只持有生命周期锁串行化“轮换↔轮换”，
+  加解密不取该锁。状态切换（旧 `ACTIVE→RETIRED`、新版本 `PENDING→ACTIVE`）在
+  密钥存储的**同一个 monitor 临界区**内提交；加密侧的状态读取（`current()`）持
+  同一把 monitor，因此它只能看到切换前或切换后的完整状态——**轮换的那一瞬间
+  系统里也始终有且仅有一个可用于加密的版本，写入绝不会因为轮换报
+  “no active key version available”**。
+- 顺序保证：切换临界区内先退休旧版本、再启用新版本；若启用写入失败，存储在释放
+  monitor 前把旧版本 Entry 原样写回（存储层自愈），随后门面对“从未启用”的
+  `PENDING` 种子做清理。回滚完成后：恰好一个 `ACTIVE`（轮换前的旧版本）、
+  无 `PENDING`/双 `ACTIVE` 残留、失败原因以 `ROTATION_FAILED` 与普通的
+  `KEY_STATE_CONFLICT` 相区分，版本号可被下一次轮换复用。
+- 轮换结束后新数据只使用新版本；轮换前产生的数据携带旧版本号，只要旧版本处于
+  `RETIRED` 保留期内，解密照常工作。
 - 连续多次轮换后，整条 `RETIRED` 链上的历史数据在被吊销前都可正确解密。
+
+### 3.1 本地如何验证“轮换期间并发写入不失败”
+
+自动化（确定性，不靠调度碰运气）：
+
+```bash
+mvn -Dtest=RotationCryptoConcurrencyTest test
+# encryptionNeverFailsWhileRotationIsParkedInsideTheAtomicSwitch
+#   轮换线程被测试栅栏精确挂在原子切换的两次状态写入之间（仍持有存储 monitor），
+#   12 个加密线程共 600 次加密同时冲进 current()：修复后 0 失败，全部落在
+#   切换后的 v2 并可正确解密，v1 历史数据照常解开；修复前该用例必现 600 次失败。
+# failureInsideTheSwitchRollsBackWhileConcurrentEncryptionKeepsSucceeding
+#   在同一挂起点注入存储故障：8 线程 400 次加密 0 失败；回滚后恰好一个 ACTIVE(v1)、
+#   无半状态残留，历史与故障期间数据均由 v1 解开，故障解除后版本号 2 可复用，
+#   失败原因码为 ROTATION_FAILED。
+```
+
+配套的非确定性压测与既有语义回归：
+
+```bash
+mvn -Dtest=KeyManagerConcurrencyTest test      # 4 轮“加密→轮换→加密”分阶段交错，
+                                               # 1600 条消息 0 失败，版本 1..5 都被使用，
+                                               # 看门狗全程采样“恰好一个 ACTIVE”
+mvn test                                        # 全量 48 个用例，确认轮换/加解密/
+                                               # 篡改拒绝/迁移/下线等均无回归
+```
+
+手工验证（两个终端持续压入写入，另一个终端轮换，写入侧不应出现失败）：
+
+```bash
+mvn spring-boot:run
+
+# 终端 A：持续写入
+while true; do
+  curl -s -XPOST localhost:8080/api/keys/encrypt -H 'Content-Type: application/json' \
+    -d '{"plaintext":"concurrent-write"}' | grep -q ciphertext || echo "ENCRYPT FAILED"
+done
+
+# 终端 B：连续轮换
+for i in $(seq 1 10); do curl -s -XPOST localhost:8080/api/keys/rotate; echo; done
+# 终端 A 全程不应打印 ENCRYPT FAILED；之后可用任意历史返回密文调 /decrypt 验证
+```
 
 ## 4. 吊销与历史数据迁移
 
@@ -238,6 +295,15 @@ curl -s -XPOST localhost:8080/api/keys/decommission -H 'Content-Type: applicatio
 
 本轮新增能力的核验路径：
 
+- `RotationCryptoConcurrencyTest`（**确定性并发时序**）：通过存储切换临界区内的
+  测试栅栏，把轮换精确挂在“旧版本已 RETIRED、新版本尚未 ACTIVE”的瞬间：
+  (1) 12 线程 600 次加密在该点同时发起，0 失败、全部落在切换后版本且可解；
+  (2) 同一点注入存储故障，8 线程 400 次加密 0 失败，回滚后恰好一个 ACTIVE、
+  历史数据可解、失败码为 `ROTATION_FAILED`、版本号可复用。对照实验：换回旧的
+  两步非原子实现时这两个用例分别必现 600/400 次失败；
+- `KeyManagerConcurrencyTest`：并发轮换串行化、唯一 ACTIVE、无重复版本；
+  轮换↔加解密采用分阶段交错（每轮“加密→轮换→加密”），1600 条消息全部可解、
+  版本 1..5 确定性地都被使用，并有看门狗全程断言“恰好一个 ACTIVE”；
 - `VersionLifecycleServiceTest`：引用计数准确、预检结论可区分（ACTIVE 挡住 vs
   引用挡住）、统计随每批迁移实时收敛、全量快照内部自洽、未知版本 404 语义；
 - `DecommissionServiceTest`：ACTIVE 拒绝（`VERSION_IS_ACTIVE`）、引用未清零拒绝
@@ -265,12 +331,15 @@ curl -s -XPOST localhost:8080/api/keys/decommission -H 'Content-Type: applicatio
 ## 9. 测试与日志
 
 ```bash
-mvn test            # 全离线运行，共 46 个用例
+mvn test            # 全离线运行，共 48 个用例
 ```
 
 覆盖场景：AES/GCM 往返与随机 IV、密文篡改/IV 篡改/错误密钥、信封畸形输入、
 密钥状态机、**并发轮换**（16 线程串行化、唯一 ACTIVE、无重复版本）、
-**轮换与加解密并发**（约 1600 条消息全部可解、版本均合法）、**迁移中断续跑/幂等/
+**轮换与加解密确定性并发**（栅栏挂起切换临界瞬间：600/400 次并发加密 0 失败；
+切换中途故障回滚后 0 失败、恰好一个在用版本、`ROTATION_FAILED` 可区分、
+版本号可复用）、**轮换与加解密分阶段交错压测**（1600 条消息全部可解、
+版本 1..5 都被使用、全程恰好一个 ACTIVE）、**迁移中断续跑/幂等/
 跨轮换续跑/吊销源版本失败隔离**、**并发迁移收敛**、数据篡改端到端拒绝、
 **版本引用统计与下线预检**、**安全下线门禁与重复/并发拒绝**、
 **千条级定向清理中断续跑与多代收敛**、**下线与清理并发竞争**，
@@ -293,9 +362,9 @@ crypto/    AesGcmCipher(加解密原语) CipherCodec(信封编解码)
 migration/ DataRecord/RecordStatus DataRepository(含 CAS 提交)
            MigrationService(全量+按来源版本定向清理) MigrationProgress/SourceCleanupProgress
 lifecycle/ VersionLifecycleService(引用统计/下线预检/安全下线编排) VersionReferenceStats
-error/     七类可区分异常（UNKNOWN_VERSION / REVOKED_VERSION /
+error/     八类可区分异常（UNKNOWN_VERSION / REVOKED_VERSION /
            INTEGRITY_FAILURE / INVALID_INPUT / KEY_STATE_CONFLICT /
-           VERSION_STILL_REFERENCED / VERSION_IS_ACTIVE）
+           ROTATION_FAILED / VERSION_STILL_REFERENCED / VERSION_IS_ACTIVE）
 config/    KeyLifecycleProperties + Spring 本地装配（启动自动启用 v1）
 web/       REST 控制器与统一异常处理（原因码 → HTTP 状态码，错误体无明文）
 ```

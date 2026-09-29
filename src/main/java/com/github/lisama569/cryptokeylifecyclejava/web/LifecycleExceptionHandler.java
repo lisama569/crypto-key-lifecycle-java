@@ -21,6 +21,7 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
  *   <li>INVALID_INPUT / 不可读请求体 → 400</li>
  *   <li>UNKNOWN_VERSION → 404</li>
  *   <li>REVOKED_VERSION / INTEGRITY_FAILURE / KEY_STATE_CONFLICT → 409</li>
+ *   <li>ROTATION_FAILED（轮换中途存储失败、已回滚）→ 500</li>
  * </ul>
  * 错误响应仅包含机器可读的原因码与不含明文的描述。
  */
@@ -71,6 +72,13 @@ public class LifecycleExceptionHandler {
     public ResponseEntity<Dtos.ErrorResponse> handleActiveVersion(
             com.github.lisama569.cryptokeylifecyclejava.error.ActiveVersionException ex) {
         return build(HttpStatus.CONFLICT, ex);
+    }
+
+    /** 轮换提交失败（存储故障，已回滚）：500 但保留可区分的 ROTATION_FAILED 原因码。 */
+    @ExceptionHandler(com.github.lisama569.cryptokeylifecyclejava.error.RotationFailedException.class)
+    public ResponseEntity<Dtos.ErrorResponse> handleRotationFailed(
+            com.github.lisama569.cryptokeylifecyclejava.error.RotationFailedException ex) {
+        return build(HttpStatus.INTERNAL_SERVER_ERROR, ex);
     }
 
     /** 兜底：任何未预期异常返回 500 且不含内部细节，避免泄露明文或堆栈。 */

@@ -10,7 +10,7 @@ import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyManager;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyState;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyStore;
 import com.github.lisama569.cryptokeylifecyclejava.crypto.KeyVersion;
-import com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException;
+import com.github.lisama569.cryptokeylifecyclejava.error.RotationFailedException;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -24,10 +24,14 @@ class RotationRollbackTest {
 
     private static final Logger log = LoggerFactory.getLogger(RotationRollbackTest.class);
 
-    /** 包装内存存储：当 PENDING 种子已写入、且调用次数达到阈值时，让旧版本状态更新失败一次。 */
+    /**
+     * 包装内存存储：在原子切换“新→ACTIVE + 旧→RETIRED”这一步注入一次存储故障。
+     * 故障点精确位于 {@link KeyStore#activateAndRetire}，是轮换期间唯一会改动
+     * 在用版本状态的提交点，确定性地复现“切换提交失败”而非靠并发碰运气。
+     */
     private static final class FailOnceOnRetireStore implements KeyStore {
         private final InMemoryKeyStore delegate = new InMemoryKeyStore();
-        private final AtomicInteger updateCalls = new AtomicInteger();
+        private final AtomicInteger switchCalls = new AtomicInteger();
         private volatile boolean armed = true;
 
         @Override public int nextVersion() { return delegate.nextVersion(); }
@@ -36,16 +40,16 @@ class RotationRollbackTest {
         @Override public Optional<SecretKey> findKey(int version) { return delegate.findKey(version); }
         @Override public Optional<KeyVersion> current() { return delegate.current(); }
         @Override public List<KeyVersion> all() { return delegate.all(); }
+        @Override public void updateState(KeyVersion meta) { delegate.updateState(meta); }
         @Override public void removeIfPending(int version) { delegate.removeIfPending(version); }
 
         @Override
-        public void updateState(KeyVersion meta) {
-            // 第一次轮换时，在“旧 ACTIVE -> RETIRED”这一步注入故障
-            if (armed && meta.state() == KeyState.RETIRED
-                    && updateCalls.incrementAndGet() == 1) {
-                throw new IllegalStateException("simulated storage outage during retire");
+        public void activateAndRetire(KeyVersion newActive, Integer retiredVersion) {
+            // 第一次轮换的原子切换提交时注入存储中断
+            if (armed && switchCalls.incrementAndGet() == 1) {
+                throw new IllegalStateException("simulated storage outage during atomic switch");
             }
-            delegate.updateState(meta);
+            delegate.activateAndRetire(newActive, retiredVersion);
         }
 
         void disarm() { armed = false; }
@@ -58,15 +62,21 @@ class RotationRollbackTest {
         km.generateAndActivate();
         String before = km.encrypt("survives-rotation-failure");
 
-        // 轮换在中途失败 → 调用方收到冲突异常
-        assertThrows(KeyConflictException.class, km::rotate);
+        // 轮换在原子切换时失败 → 可区分的 ROTATION_FAILED 原因（非通用状态冲突）
+        RotationFailedException failure = assertThrows(RotationFailedException.class, km::rotate);
+        assertEquals("ROTATION_FAILED", failure.reasonCode());
+        assertEquals("simulated storage outage during atomic switch",
+                failure.getCause().getMessage());
 
         // 回滚后无半更新状态：v1 恢复 ACTIVE，没有第二个版本，唯一 ACTIVE 仍是 v1
         assertEquals(1, store.all().size());
         assertEquals(KeyState.ACTIVE, store.all().get(0).state());
         assertEquals(1, km.currentVersion().version());
-        // 失败期间写入的数据仍可由 v1 解密
+        // 失败期间写入的数据仍可由 v1 解密；回滚后新写入也立刻成功，不会出现没有可用版本
         assertEquals("survives-rotation-failure", km.decrypt(before));
+        String afterFailure = km.encrypt("immediately-after-rollback");
+        assertEquals("immediately-after-rollback", km.decrypt(afterFailure));
+        assertEquals(1, new CipherCodec().decode(afterFailure).keyVersion());
 
         // 故障解除后立即重试：复用版本号 2，干净地完成轮换
         store.disarm();

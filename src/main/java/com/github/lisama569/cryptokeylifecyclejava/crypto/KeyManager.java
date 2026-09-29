@@ -3,6 +3,7 @@ package com.github.lisama569.cryptokeylifecyclejava.crypto;
 import com.github.lisama569.cryptokeylifecyclejava.error.InvalidInputException;
 import com.github.lisama569.cryptokeylifecyclejava.error.KeyConflictException;
 import com.github.lisama569.cryptokeylifecyclejava.error.RevokedVersionException;
+import com.github.lisama569.cryptokeylifecyclejava.error.RotationFailedException;
 import com.github.lisama569.cryptokeylifecyclejava.error.UnknownVersionException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -25,8 +26,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p>并发与原子性语义：
  * <ul>
- *   <li>{@code lifecycleLock} 保证“生成新密钥 + 旧版本转 RETIRED + 新版本 ACTIVE”整体原子，
- *       并发轮换被串行化；轮换流程中任何异常都会在锁内回滚本次变更，不留半更新状态；</li>
+ *   <li>{@code lifecycleLock} 保证“生成新密钥 + 旧版本转 RETIRED + 新版本 ACTIVE”整体
+ *       串行，并发轮换互斥；轮换流程中任何异常都会在锁内回滚本次变更，不留半更新状态；</li>
+ *   <li>轮换与在线加解密<b>不互斥</b>：加密不取生命周期锁。状态切换由
+ *       {@link KeyStore#activateAndRetire} 在存储内部一次原子提交，加密侧只能观察到
+ *       “切换前（旧版本 ACTIVE）”或“切换后（新版本 ACTIVE）”，任何时刻系统里都恰好
+ *       有一个 ACTIVE，不存在“没有可用密钥版本”的窗口，写入不会因轮换而失败；</li>
  *   <li>加密始终读取当下唯一的 ACTIVE 版本，轮换后新数据只使用新版本；</li>
  *   <li>解密允许 ACTIVE 与保留期内的 RETIRED 版本，REVOKED 一律拒绝；</li>
  *   <li>同一版本不会被重复启用（put 拒绝重复版本号，状态机不允许逆向转换）。</li>
@@ -81,48 +86,77 @@ public class KeyManager {
 
     /**
      * 原子轮换：当前 ACTIVE 版本转 RETIRED，同时新版本置为 ACTIVE。
-     * 返回新版本元数据。无 ACTIVE 版本时先初始化（与 generateAndActivate 互斥，不会重复）。
+     *
+     * <p>无 ACTIVE 版本时先初始化首个版本（直接以 ACTIVE 落库，从不对外暴露
+     * “没有 ACTIVE”的状态）。正常轮换分两步：先写入 PENDING 种子版本（不可用），
+     * 再通过 {@link KeyStore#activateAndRetire} 在存储的<b>同一次原子更新</b>内完成
+     * “新版本 ACTIVE + 旧版本 RETIRED”。并发加密不持有生命周期锁，但存储原子切换
+     * 保证它读到的状态要么是切换前（旧 ACTIVE），要么是切换后（新 ACTIVE），
+     * 轮换期间任何时刻都恰好有一个可用于加密的版本，写入不会因轮换而失败。
+     *
+     * <p>提交阶段抛错时在锁内回滚：旧版本恢复 ACTIVE、未启用的新版本移除，
+     * 版本号可复用；并以 {@link RotationFailedException}（{@code ROTATION_FAILED}）
+     * 给出与普通状态冲突可区分的失败原因。
      */
     public RotationResult rotate() {
         lifecycleLock.lock();
         try {
             KeyVersion current = keyStore.current().orElse(null);
             int newVersionNumber = keyStore.nextVersion();
-            KeyVersion newMeta = null;
-            try {
-                // 1) 先生成并写入新密钥（PENDING 不可用），保证密钥材料就绪后才切换状态
-                SecretKey newKey = AesGcmCipher.generateKey(keyBits);
-                newMeta = new KeyVersion(newVersionNumber, KeyState.PENDING, Instant.now(), null, null);
-                keyStore.put(newMeta, newKey);
-
-                // 2) 旧 ACTIVE -> RETIRED（保留期内仍可解密）
-                if (current != null) {
-                    KeyVersion retired = new KeyVersion(current.version(), KeyState.RETIRED,
-                            current.createdAt(), Instant.now(), null);
-                    keyStore.updateState(retired);
-                }
-
-                // 3) 新版本 PENDING -> ACTIVE
+            SecretKey newKey = AesGcmCipher.generateKey(keyBits);
+            if (current == null) {
+                // 首个版本：直接 ACTIVE，不存在旧版本，无中间窗口
                 KeyVersion active = new KeyVersion(newVersionNumber, KeyState.ACTIVE,
-                        newMeta.createdAt(), null, null);
-                keyStore.updateState(active);
+                        Instant.now(), null, null);
+                try {
+                    keyStore.put(active, newKey);
+                } catch (RuntimeException ex) {
+                    throw rotationFailure(newVersionNumber, ex);
+                }
+                log.info("op=ROTATE result=ACCEPT basis=FIRST_VERSION_ACTIVE previousVersion=-1 activeVersion={}",
+                        newVersionNumber);
+                return new RotationResult(-1, active);
+            }
+
+            // 1) 密钥材料就绪：先以 PENDING 落库（不可用于加解密）
+            KeyVersion pending = new KeyVersion(newVersionNumber, KeyState.PENDING,
+                    Instant.now(), null, null);
+            try {
+                keyStore.put(pending, newKey);
+            } catch (RuntimeException ex) {
+                // 种子尚未写入，状态无任何变化
+                throw rotationFailure(newVersionNumber, ex);
+            }
+            try {
+                // 2) 原子切换：新→ACTIVE 与 旧→RETIRED 同时对外可见
+                KeyVersion active = new KeyVersion(newVersionNumber, KeyState.ACTIVE,
+                        pending.createdAt(), null, null);
+                keyStore.activateAndRetire(active, current.version());
 
                 log.info("op=ROTATE result=ACCEPT basis=ATOMIC_SWITCH previousVersion={} activeVersion={}",
-                        current == null ? -1 : current.version(), newVersionNumber);
-                return new RotationResult(current == null ? -1 : current.version(), active);
+                        current.version(), newVersionNumber);
+                return new RotationResult(current.version(), active);
             } catch (RuntimeException ex) {
-                // 回滚：清除可能已写入的 PENDING 新版本；旧版本若已被转 RETIRED 则恢复 ACTIVE
-                rollbackAfterFailedRotate(current, newMeta);
-                if (ex instanceof com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException) {
-                    throw ex;
-                }
-                log.error("op=ROTATE result=FAIL basis=ROLLED_BACK intendedVersion={} error={}",
-                        newVersionNumber, ex.getClass().getSimpleName());
-                throw new KeyConflictException("key rotation failed and was rolled back");
+                rollbackAfterFailedRotate(current, pending);
+                throw rotationFailure(newVersionNumber, ex);
             }
         } finally {
             lifecycleLock.unlock();
         }
+    }
+
+    private RotationFailedException rotationFailure(int intendedVersion, RuntimeException cause) {
+        if (cause instanceof RotationFailedException rfe) {
+            return rfe;
+        }
+        log.error("op=ROTATE result=FAIL basis=ROLLED_BACK intendedVersion={} error={}",
+                intendedVersion, cause.getClass().getSimpleName());
+        if (cause instanceof com.github.lisama569.cryptokeylifecyclejava.error.KeyLifecycleException kle) {
+            return new RotationFailedException(
+                    "key rotation failed and was rolled back: " + kle.getMessage(), cause);
+        }
+        return new RotationFailedException(
+                "key rotation failed due to a storage error and was rolled back", cause);
     }
 
     private void rollbackAfterFailedRotate(KeyVersion previousActive, KeyVersion pendingNew) {

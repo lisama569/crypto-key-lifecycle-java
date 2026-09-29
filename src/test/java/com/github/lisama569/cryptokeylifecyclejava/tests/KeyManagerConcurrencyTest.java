@@ -66,46 +66,96 @@ class KeyManagerConcurrencyTest {
                 km.currentVersion().version(), threads);
     }
 
+    private static void encryptOne(KeyManager km, int workerId, int i,
+                                   ConcurrentHashMap<String, String> produced,
+                                   AtomicInteger failures) {
+        try {
+            String plain = "worker-" + workerId + "-msg-" + i;
+            String cipher = km.encrypt(plain);
+            produced.put(cipher, plain); // 密文随机 IV，键天然唯一
+        } catch (RuntimeException ex) {
+            failures.incrementAndGet();
+        }
+    }
+
     @Test
     void encryptAndDecryptStayCorrectWhileRotationsHappenConcurrently() throws Exception {
         KeyManager km = newManager();
         km.generateAndActivate();
 
         int encryptors = 8;
-        int rotators = 4;
+        int rounds = 4;
         int perEncryptor = 200;
-        ExecutorService pool = Executors.newFixedThreadPool(encryptors + rotators);
+        int batch = perEncryptor / (rounds * 2); // 每轮“轮换前 + 轮换后”两小批
+        ExecutorService pool = Executors.newFixedThreadPool(encryptors + 1);
+        ExecutorService watchdogPool = Executors.newSingleThreadExecutor();
         CountDownLatch start = new CountDownLatch(1);
         ConcurrentHashMap<String, String> produced = new ConcurrentHashMap<>();
         AtomicInteger failures = new AtomicInteger();
+        AtomicInteger invariantViolations = new AtomicInteger();
 
-        for (int r = 0; r < rotators; r++) {
-            pool.submit(() -> {
-                start.await();
+        // 两方 phaser（轮换线程 + 一个加密代表），确定性制造每轮的交错：
+        //   加密一批（落在当前 ACTIVE）→ 轮换原子提交 → 再加密一批（落在新 ACTIVE）
+        java.util.concurrent.Phaser phaser = new java.util.concurrent.Phaser(2) {
+            @Override
+            protected boolean onAdvance(int phase, int registeredParties) {
+                return phase >= rounds * 2 - 1;
+            }
+        };
+
+        pool.submit(() -> {
+            start.await();
+            for (int round = 0; round < rounds; round++) {
+                phaser.arriveAndAwaitAdvance(); // 阶段 2r：放行“轮换前”加密批次，等其完成
+                phaser.arriveAndAwaitAdvance(); // 阶段 2r+1：轮换提交，再放行“轮换后”批次
                 km.rotate();
-                return null;
-            });
-        }
+            }
+            return null;
+        });
         for (int e = 0; e < encryptors; e++) {
             final int workerId = e;
             pool.submit(() -> {
                 start.await();
-                for (int i = 0; i < perEncryptor; i++) {
-                    try {
-                        String plain = "worker-" + workerId + "-msg-" + i;
-                        String cipher = km.encrypt(plain);
-                        produced.put(cipher, plain); // 密文随机 IV，键天然唯一
-                    } catch (RuntimeException ex) {
-                        failures.incrementAndGet();
+                int counter = 0;
+                for (int round = 0; round < rounds; round++) {
+                    for (int i = 0; i < batch; i++) {
+                        encryptOne(km, workerId, counter++, produced, failures);
                     }
+                    if (workerId == 0) {
+                        // 代表所有加密线程与轮换线程同步：先报“轮换前批次完成”，
+                        // 再等轮换提交结束后才继续，保证每轮都跨两个版本加密
+                        phaser.arriveAndAwaitAdvance();
+                        phaser.arriveAndAwaitAdvance();
+                    }
+                    for (int i = 0; i < batch; i++) {
+                        encryptOne(km, workerId, counter++, produced, failures);
+                    }
+                }
+                while (counter < perEncryptor) {
+                    encryptOne(km, workerId, counter++, produced, failures);
                 }
                 return null;
             });
         }
+        // 看门狗：轮换+加解密全程高频采样，任何时刻都必须恰好有一个 ACTIVE，
+        // 不允许出现“没有可用版本”（0 个）或重复启用（多于 1 个）
+        java.util.concurrent.Future<?> watchdog = watchdogPool.submit(() -> {
+            start.await();
+            while (!Thread.currentThread().isInterrupted()) {
+                long active = km.listVersions().stream()
+                        .filter(v -> v.state() == KeyState.ACTIVE).count();
+                if (active != 1) {
+                    invariantViolations.incrementAndGet();
+                }
+                Thread.sleep(1); // 高频但不独占线程
+            }
+            return null;
+        });
         start.countDown();
         pool.shutdown();
         assertTrue(pool.awaitTermination(60, TimeUnit.SECONDS));
-
+        watchdog.cancel(true);
+        watchdogPool.shutdownNow();
         // 全部密文可解，且明文与生产时一致；每条密文使用的版本必须是当时“当前启用”的有效版本
         Set<Integer> usedVersions = new HashSet<>();
         CipherCodec codec = new CipherCodec();
@@ -120,6 +170,8 @@ class KeyManagerConcurrencyTest {
                     "data must not be encrypted under " + state + " version");
         });
         assertEquals(0, failures.get());
+        assertEquals(0, invariantViolations.get(),
+                "exactly one ACTIVE version must be observable throughout rotation");
         assertTrue(usedVersions.size() >= 2, "rotations should cause multiple active versions to be used");
         log.info("[concurrency] version={} op=ROTATE_VS_CRYPTO messages={} versionsUsed={} basis=NO_HALF_STATE result=PASS",
                 km.currentVersion().version(), produced.size(), usedVersions);
